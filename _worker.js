@@ -1,4 +1,4 @@
-const Version = '2026-07-02 13:00:00 MultiProtocol';
+const Version = '2026-07-02 15:30:00 MultiProtocol';
 let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
 let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -38,33 +38,46 @@ function 节点协议显示名(protocol) {
 	return protocol === 'vless' ? 'VLESS' : protocol === 'trojan' ? 'Trojan' : 'Shadowsocks';
 }
 
-async function 获取增强后台页面(search = '') {
-	const upstream = await fetch(Pages静态页面 + '/admin' + search);
-	const contentType = upstream.headers.get('content-type') || '';
-	if (!contentType.toLowerCase().includes('text/html')) return upstream;
-
-	let html = await upstream.text();
-	const 注入脚本 = String.raw`
-<script id="edt-multi-protocol-enhancer">
+const 多协议后台脚本 = String.raw`
 (() => {
+  if (window.__EDT_MULTI_PROTOCOL_V2__) return;
+  window.__EDT_MULTI_PROTOCOL_V2__ = true;
+
   const OPTIONS = [
     { value: 'vless', label: 'VLESS' },
     { value: 'trojan', label: 'Trojan' },
     { value: 'ss', label: 'Shadowsocks' }
   ];
-  const PANEL_ID = 'edt-multi-protocol-panel';
+  const ROOT_ID = 'edt-multi-protocol-root';
   let selected = ['vless'];
+  let configLoaded = false;
+  let mountTimer = null;
 
   const normalize = (value) => {
     const aliases = { vless: 'vless', vl: 'vless', trojan: 'trojan', tro: 'trojan', ss: 'ss', shadowsocks: 'ss', shadowrocket: 'ss' };
-    const list = Array.isArray(value) ? value : String(value || '').split(/[\s,，|;+]+/);
+    const list = Array.isArray(value) ? value : String(value || '').split(/[\\s,，|;+]+/);
     return [...new Set(list.map(v => aliases[String(v || '').trim().toLowerCase()]).filter(Boolean))];
   };
 
+  const getRoot = () => document.getElementById(ROOT_ID);
   const checkedValues = () => {
-    const panel = document.getElementById(PANEL_ID);
-    if (!panel) return selected.slice();
-    return [...panel.querySelectorAll('input[data-edt-protocol]:checked')].map(input => input.value);
+    const root = getRoot();
+    if (!root) return selected.slice();
+    return [...root.querySelectorAll('input[data-edt-protocol]:checked')].map(input => input.value);
+  };
+
+  const syncNativeControl = () => {
+    const root = getRoot();
+    if (!root) return;
+    const control = root.__edtNativeControl;
+    const values = checkedValues();
+    if (!control || !values.length) return;
+    const value = values[0];
+    try {
+      control.value = value;
+      control.dispatchEvent(new Event('input', { bubbles: true }));
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_) {}
   };
 
   const patchConfig = (config) => {
@@ -75,90 +88,138 @@ async function 获取增强后台页面(search = '') {
     return config;
   };
 
-  const findAnchor = () => {
-    const all = [...document.querySelectorAll('label, legend, dt, th, h1, h2, h3, h4, span, div')];
-    return all.find(el => {
-      const text = (el.textContent || '').replace(/\s+/g, '').trim();
-      return text === '协议类型' || text === '节点协议' || text === '节点协议类型';
-    }) || all.find(el => /协议类型|节点协议/.test(el.textContent || '')) || null;
+  const exactText = (el) => (el && el.textContent || '').replace(/\\s+/g, '').trim();
+
+  const findLabel = () => {
+    const nodes = [...document.querySelectorAll('label,legend,dt,th,span,div')];
+    return nodes.find(el => {
+      const text = exactText(el);
+      return (text === '节点协议' || text === '协议类型' || text === '节点协议类型') && el.children.length <= 2;
+    }) || null;
+  };
+
+  const findField = (label) => {
+    let node = label;
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      const controls = [...node.querySelectorAll('select,input,[role="combobox"]')].filter(el => {
+        if (el.closest('#' + ROOT_ID)) return false;
+        if (el.tagName === 'INPUT') {
+          const type = (el.getAttribute('type') || 'text').toLowerCase();
+          if (['checkbox', 'radio', 'hidden', 'button', 'submit'].includes(type)) return false;
+        }
+        return true;
+      });
+      const protocolControl = controls.find(el => {
+        const value = String(el.value || el.textContent || '').trim().toLowerCase();
+        return /^(vless|trojan|ss|shadowsocks|shadowrocket)$/.test(value);
+      });
+      if (protocolControl) return { row: node, control: protocolControl };
+    }
+    return { row: label.parentElement || label, control: null };
   };
 
   const setStatus = (message, ok = true) => {
-    const status = document.querySelector('#' + PANEL_ID + ' [data-edt-status]');
+    const root = getRoot();
+    const status = root && root.querySelector('[data-edt-status]');
     if (!status) return;
     status.textContent = message;
     status.style.color = ok ? '#138a4b' : '#c0392b';
   };
 
+  const applySelectedToUI = () => {
+    const root = getRoot();
+    if (!root) return;
+    root.querySelectorAll('input[data-edt-protocol]').forEach(input => {
+      input.checked = selected.includes(input.value);
+    });
+  };
+
   const saveProtocols = async () => {
     try {
       setStatus('正在保存…');
-      if (!checkedValues().length) throw new Error('请至少选择一种节点协议');
-      const currentResponse = await fetch('/admin/config.json', { cache: 'no-store' });
+      const values = checkedValues();
+      if (!values.length) throw new Error('请至少选择一种节点协议');
+      const currentResponse = await window.__EDT_ORIGINAL_FETCH__('/admin/config.json', { cache: 'no-store' });
       if (!currentResponse.ok) throw new Error('读取当前配置失败');
       const current = patchConfig(await currentResponse.json());
-      const saveResponse = await fetch('/admin/config.json', {
+      const saveResponse = await window.__EDT_ORIGINAL_FETCH__('/admin/config.json', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json;charset=utf-8' },
         body: JSON.stringify(current)
       });
       const result = await saveResponse.json().catch(() => ({}));
       if (!saveResponse.ok || result.success !== true) throw new Error(result.error || result.message || '保存失败');
-      selected = checkedValues();
-      setStatus('已保存；刷新订阅后会同时生成所选协议。');
+      selected = values;
+      syncNativeControl();
+      setStatus('已保存，重新更新订阅即可。');
     } catch (error) {
       setStatus(error && error.message ? error.message : String(error), false);
     }
   };
 
-  const mountInto = (container) => {
-    if (document.getElementById(PANEL_ID)) return true;
-    const panel = document.createElement('div');
-    panel.id = PANEL_ID;
-    panel.innerHTML =
-      '<div class="edt-mp-title">节点协议（可多选）</div>' +
-      '<div class="edt-mp-options">' + OPTIONS.map(item =>
-        '<label><input type="checkbox" data-edt-protocol value="' + item.value + '"> <span>' + item.label + '</span></label>'
+  const createRoot = (nativeControl) => {
+    const root = document.createElement('div');
+    root.id = ROOT_ID;
+    root.__edtNativeControl = nativeControl || null;
+    root.innerHTML =
+      '<div class="edt-mp-box">' + OPTIONS.map(item =>
+        '<label class="edt-mp-option"><input type="checkbox" data-edt-protocol value="' + item.value + '"><span>' + item.label + '</span></label>'
       ).join('') + '</div>' +
-      '<div class="edt-mp-actions"><button type="button" data-edt-save>保存协议选择</button><span data-edt-status></span></div>' +
-      '<div class="edt-mp-note">可同时勾选三种协议；订阅会为每个优选地址分别生成对应节点。</div>';
-    container.appendChild(panel);
-    panel.querySelectorAll('input[data-edt-protocol]').forEach(input => {
+      '<div class="edt-mp-footer"><button type="button" data-edt-save>保存协议选择</button><span data-edt-status></span></div>';
+    root.querySelectorAll('input[data-edt-protocol]').forEach(input => {
       input.checked = selected.includes(input.value);
       input.addEventListener('change', () => {
         if (!checkedValues().length) input.checked = true;
+        selected = checkedValues();
+        syncNativeControl();
       });
     });
-    panel.querySelector('[data-edt-save]').addEventListener('click', saveProtocols);
-    return true;
+    root.querySelector('[data-edt-save]').addEventListener('click', saveProtocols);
+    return root;
   };
 
   const mount = () => {
-    if (document.getElementById(PANEL_ID)) return true;
-    const anchor = findAnchor();
-    if (!anchor) return false;
-    const container = anchor.closest('.form-group, .setting-item, .config-item, .card, .row, li, section') || anchor.parentElement || document.body;
-    return mountInto(container);
+    const existing = getRoot();
+    if (existing && existing.isConnected) {
+      if (configLoaded) applySelectedToUI();
+      return true;
+    }
+    const label = findLabel();
+    if (!label) return false;
+    const field = findField(label);
+    const root = createRoot(field.control);
+
+    if (field.control) {
+      const parent = field.control.parentElement || field.row;
+      field.control.setAttribute('data-edt-original-protocol-control', '1');
+      field.control.style.setProperty('display', 'none', 'important');
+      parent.appendChild(root);
+    } else {
+      field.row.appendChild(root);
+    }
+    if (configLoaded) applySelectedToUI();
+    return true;
   };
 
   const style = document.createElement('style');
+  style.id = 'edt-multi-protocol-style';
   style.textContent =
-    '#'+PANEL_ID+'{margin:14px 0;padding:14px 16px;border:1px solid rgba(127,127,127,.25);border-radius:12px;background:rgba(127,127,127,.06);font-size:14px}' +
-    '#'+PANEL_ID+' .edt-mp-title{font-weight:650;margin-bottom:10px}' +
-    '#'+PANEL_ID+' .edt-mp-options{display:flex;flex-wrap:wrap;gap:10px 18px}' +
-    '#'+PANEL_ID+' label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}' +
-    '#'+PANEL_ID+' input{width:16px;height:16px}' +
-    '#'+PANEL_ID+' .edt-mp-actions{display:flex;align-items:center;gap:10px;margin-top:12px}' +
-    '#'+PANEL_ID+' button{border:0;border-radius:8px;padding:8px 14px;cursor:pointer;background:#2563eb;color:#fff}' +
-    '#'+PANEL_ID+' [data-edt-status]{font-size:13px}' +
-    '#'+PANEL_ID+' .edt-mp-note{margin-top:8px;opacity:.68;font-size:12px;line-height:1.5}';
-  document.head.appendChild(style);
+    '#'+ROOT_ID+'{width:100%;box-sizing:border-box}' +
+    '#'+ROOT_ID+' .edt-mp-box{min-height:38px;box-sizing:border-box;display:flex;align-items:center;flex-wrap:wrap;gap:10px 24px;padding:8px 12px;border:1px solid #d8dee8;border-radius:8px;background:#fff}' +
+    '#'+ROOT_ID+' .edt-mp-option{display:inline-flex;align-items:center;gap:7px;cursor:pointer;white-space:nowrap;color:#273244;font-size:14px}' +
+    '#'+ROOT_ID+' .edt-mp-option input{width:16px;height:16px;margin:0;accent-color:#2563eb}' +
+    '#'+ROOT_ID+' .edt-mp-footer{display:flex;align-items:center;gap:10px;margin-top:7px;min-height:24px}' +
+    '#'+ROOT_ID+' button{border:0;border-radius:7px;padding:5px 11px;cursor:pointer;background:#2563eb;color:#fff;font-size:12px}' +
+    '#'+ROOT_ID+' [data-edt-status]{font-size:12px}' +
+    '@media (prefers-color-scheme:dark){#'+ROOT_ID+' .edt-mp-box{background:#111827;border-color:#374151}#'+ROOT_ID+' .edt-mp-option{color:#e5e7eb}}';
+  (document.head || document.documentElement).appendChild(style);
 
   const originalFetch = window.fetch.bind(window);
+  window.__EDT_ORIGINAL_FETCH__ = originalFetch;
   window.fetch = async (input, init = {}) => {
     const target = typeof input === 'string' ? input : (input && input.url) || '';
     const method = String(init.method || (input && input.method) || 'GET').toUpperCase();
-    if (method === 'POST' && /\/admin\/config\.json(?:\?|$)/.test(target) && typeof init.body === 'string') {
+    if (method === 'POST' && /(?:^|\\/)admin\\/config\\.json(?:\\?|$)/.test(target) && typeof init.body === 'string') {
       try {
         const data = JSON.parse(init.body);
         init = { ...init, body: JSON.stringify(patchConfig(data)) };
@@ -178,7 +239,7 @@ async function 获取增强后台页面(search = '') {
       return originalOpen.call(this, method, url, ...rest);
     };
     XMLHttpRequest.prototype.send = function(body) {
-      if (this.__edtMethod === 'POST' && /\/admin\/config\.json(?:\?|$)/.test(this.__edtUrl) && typeof body === 'string') {
+      if (this.__edtMethod === 'POST' && /(?:^|\\/)admin\\/config\\.json(?:\\?|$)/.test(this.__edtUrl) && typeof body === 'string') {
         try {
           body = JSON.stringify(patchConfig(JSON.parse(body)));
         } catch (error) {
@@ -189,43 +250,61 @@ async function 获取增强后台页面(search = '') {
     };
   }
 
-  const init = async () => {
+  const loadConfig = async () => {
     try {
-      const response = await originalFetch('/admin/config.json', { cache: 'no-store' });
+      const response = await originalFetch('/admin/config.json?_edt=' + Date.now(), { cache: 'no-store' });
       if (response.ok) {
         const config = await response.json();
         selected = normalize(config.协议类型列表 && config.协议类型列表.length ? config.协议类型列表 : config.协议类型);
         if (!selected.length) selected = ['vless'];
       }
     } catch (_) {}
-    if (mount()) return;
-    const observer = new MutationObserver(() => {
-      if (mount()) observer.disconnect();
-    });
+    configLoaded = true;
+    applySelectedToUI();
+  };
+
+  const scheduleMount = () => {
+    clearTimeout(mountTimer);
+    mountTimer = setTimeout(mount, 60);
+  };
+
+  const init = () => {
+    mount();
+    loadConfig();
+    const observer = new MutationObserver(scheduleMount);
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => {
-      if (!document.getElementById(PANEL_ID)) {
-        const fallback = document.createElement('div');
-        fallback.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:2147483647;max-width:420px';
-        document.body.appendChild(fallback);
-        mountInto(fallback);
-      }
-    }, 2500);
+    setInterval(() => {
+      if (!getRoot() || !getRoot().isConnected) mount();
+    }, 1500);
   };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
   else init();
 })();
-</script>`;
+`;
 
-	if (/<\/body>/i.test(html)) html = html.replace(/<\/body>/i, 注入脚本 + '\n</body>');
-	else html += 注入脚本;
+async function 获取增强后台页面(search = '') {
+	const upstream = await fetch(Pages静态页面 + '/admin' + search, { cf: { cacheTtl: 0, cacheEverything: false } });
+	const contentType = upstream.headers.get('content-type') || '';
+	if (!contentType.toLowerCase().includes('text/html')) return upstream;
+
+	let html = await upstream.text();
+	// 清理上游页面中可能禁止自定义脚本的 meta CSP；响应头 CSP 也会在下面移除。
+	html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '');
+	const scriptTag = '<script src="/admin/multiprotocol.js?v=20260702-2" defer></script>';
+	if (/<\/body>/i.test(html)) html = html.replace(/<\/body>/i, scriptTag + '\n</body>');
+	else html += scriptTag;
+
 	const headers = new Headers(upstream.headers);
 	headers.delete('content-length');
 	headers.delete('content-encoding');
+	headers.delete('etag');
+	headers.delete('last-modified');
 	headers.delete('content-security-policy');
 	headers.delete('content-security-policy-report-only');
-	headers.set('Cache-Control', 'no-store');
+	headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+	headers.set('Pragma', 'no-cache');
+	headers.set('Expires', '0');
 	return new Response(html, { status: upstream.status, statusText: upstream.statusText, headers });
 }
 
@@ -320,6 +399,9 @@ export default {
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					// 没有cookie或cookie错误，跳转到/login页面
 					if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
+					if (访问路径 === 'admin/multiprotocol.js') {
+						return new Response(多协议后台脚本, { status: 200, headers: { 'Content-Type': 'application/javascript;charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate', 'X-Content-Type-Options': 'nosniff' } });
+					}
 					if (访问路径 === 'admin/log.json') {// 读取日志内容
 						const 读取日志内容 = await env.KV.get('log.json') || '[]';
 						return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
